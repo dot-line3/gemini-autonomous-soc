@@ -1,3 +1,4 @@
+import re
 import os
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
@@ -29,8 +30,8 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 # 메인 LLM 서비스용 Fallback Chain 모델 리스트
 MAIN_MODELS_CHAIN = [
     "gemini-3.5-flash-lite",      # 1순위: 메인 서비스 모델
-    "gemini-3.1-flash-lite",      # 2순위: 백업 모델
-    "gemini-2.5-flash-lite"       # 3순위: 초경량 백업 모델
+    "gemini-3.6-flash",           # 2순위: gemini-2.5-flash-lite 제공 중단(404)으로 교체, 실측상 3.1-flash-lite보다 빨라 2순위
+    "gemini-3.1-flash-lite"       # 3순위: 백업 모델
 ]
 
 
@@ -60,6 +61,29 @@ def admin_reset_db(confirm: bool = Query(False)):
         )
     reset_db()
     return {"status": "success", "message": "Database successfully reset."}
+
+
+def _sanitize_failure_reason(raw: str, sanitized: str) -> str | None:
+    """L2 정화 결과가 '다시 쓴 요청문'으로 보이지 않으면 실패 사유를 반환한다.
+    벤치마크 로그에서 확인된 세 가지 실패 유형을 막는다.
+    - EMPTY  : 남길 정상 요청이 없음 (요청 전체가 악성)
+    - NOOP   : 원문을 그대로 돌려줌 (아무것도 제거하지 못함)
+    - ANSWER : 요청을 다시 쓰지 않고 직접 답변함 (코드 블록, 여러 문단, 원문보다 훨씬 긴 출력)
+    """
+    def _norm(t: str) -> str:
+        return re.sub(r"[\s\W_]+", "", t or "").lower()
+    out = (sanitized or "").strip()
+    if not out:
+        return "EMPTY"
+    if _norm(out) == _norm(raw):
+        return "NOOP"
+    if "```" in out and "```" not in raw:
+        return "ANSWER"
+    if out.count("\n") >= 3 and raw.count("\n") < 2:
+        return "ANSWER"
+    if len(out) > len(raw) * 1.5 + 40:
+        return "ANSWER"
+    return None
 
 
 async def run_security_pipeline(user_id: str, raw_prompt: str) -> SecurityDecision:
@@ -124,6 +148,15 @@ async def run_security_pipeline(user_id: str, raw_prompt: str) -> SecurityDecisi
             raise HTTPException(
                 status_code=503,
                 detail="[SOC Warning] Prompt sanitization is temporarily unavailable. Please try again later.",
+            )
+        # 정화 결과 검증: 정화기(L2)도 AI라서 출력을 그대로 믿지 않는다. 이상하면 통과시키지 않고 차단 (Fail-Closed)
+        failure = _sanitize_failure_reason(raw_prompt, final_prompt)
+        if failure:
+            log_event(user_id, raw_prompt, threat_score, attack_type, f"BLOCKED_SANITIZE_{failure}")
+            print(f"[SOC Defense] Sanitization failed ({failure}) -> blocked: '{raw_prompt[:60]}'")
+            raise HTTPException(
+                status_code=403,
+                detail=f"[SOC Blocked] Suspicious request could not be safely sanitized ({attack_type}). Reason: {reason}",
             )
         print(f"[SOC Defense] Prompt Sanitized: '{raw_prompt}' -> '{final_prompt}'")
 
