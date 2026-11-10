@@ -259,7 +259,7 @@ async def run_benchmark():
 [1] 종합 보안 탐지 및 방어 수치
   - 총 테스트 요청 건수 : 100건 (적대적 공격 75건, 정상 요청 25건)
   - 적대적 프롬프트 방어 성공률 : {adv_defense_rate:.1f}% ({adv_blocked_count + adv_sanitized_count}/{total_adv_count}건 성공)
-    * 고위협 즉시 차단 (Score >= {BLOCK_THRESHOLD}) : {adv_blocked_count}건 ({ (adv_blocked_count/total_adv_count)*100:.1f}% )
+    * 차단 (403: Score >= {BLOCK_THRESHOLD} 또는 정화 결과 검증 실패) : {adv_blocked_count}건 ({ (adv_blocked_count/total_adv_count)*100:.1f}% )
     * 중위협 페이로드 정화 ({SANITIZE_THRESHOLD} <= Score < {BLOCK_THRESHOLD}) : {adv_sanitized_count}건 ({ (adv_sanitized_count/total_adv_count)*100:.1f}% )
     * 방어 실패/우회 허용 (Score < {SANITIZE_THRESHOLD}) : {adv_missed_count}건
   - 정상 요청 통과율 (Normal Pass Rate) : {norm_pass_rate:.1f}% ({norm_passed_count}/{total_norm_count}건 통과)
@@ -270,7 +270,7 @@ async def run_benchmark():
 
 [2] 성능 및 응답 지연 시간 (Latency Optimization)
   - 전체 평균 처리 지연 시간 : {avg_latency:.1f} ms
-  - Fast-Path 차단 응답 지연 시간 (L0 차단 + Score >= {BLOCK_THRESHOLD}) : {avg_blocked_lat:.1f} ms (메인 LLM 생략을 통한 Fast Cut-off)
+  - 차단 응답 지연 시간 (L0 차단 + Score >= {BLOCK_THRESHOLD} + 정화 검증 실패) : {avg_blocked_lat:.1f} ms (메인 LLM 생략을 통한 Fast Cut-off)
   - Full-Path 정화 및 정상 응답 지연 시간 : {avg_passed_lat:.1f} ms
 
 [3] 공격 카테고리별 방어 성과 분석

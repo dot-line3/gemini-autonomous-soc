@@ -1,10 +1,9 @@
+import difflib
 import re
 import os
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
-from google import genai
-from google.genai import errors
 from pydantic import BaseModel
 
 from agents import (
@@ -13,6 +12,7 @@ from agents import (
     SecurityAnalysisUnavailable,
     analyze_threat_l1_async,
     sanitize_prompt_l2_async,
+    generate_main_llm_text,
     stream_main_llm_response,
     l0_pre_filter,
 )
@@ -23,9 +23,7 @@ load_dotenv()
 
 app = FastAPI(title="Autonomous AI SOC Security Gateway")
 
-# Gemini API 클라이언트 설정
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-client = genai.Client(api_key=GEMINI_API_KEY)
+# Gemini API 호출은 agents.py의 클라이언트가 담당 (보안 판정과 메인 응답이 서킷 상태를 공유)
 
 # 메인 LLM 서비스용 Fallback Chain 모델 리스트
 MAIN_MODELS_CHAIN = [
@@ -63,6 +61,9 @@ def admin_reset_db(confirm: bool = Query(False)):
     return {"status": "success", "message": "Database successfully reset."}
 
 
+NOOP_SIMILARITY = 0.85  # 정화 전후 유사도가 이 이상이면 아무것도 제거하지 못한 것으로 판단
+
+
 def _sanitize_failure_reason(raw: str, sanitized: str) -> str | None:
     """L2 정화 결과가 '다시 쓴 요청문'으로 보이지 않으면 실패 사유를 반환한다.
     벤치마크 로그에서 확인된 세 가지 실패 유형을 막는다.
@@ -76,6 +77,10 @@ def _sanitize_failure_reason(raw: str, sanitized: str) -> str | None:
     if not out:
         return "EMPTY"
     if _norm(out) == _norm(raw):
+        return "NOOP"
+    # 몇 글자만 지우고 요청 내용은 그대로인 경우도 NOOP으로 본다
+    # (벤치마크 ⑥에서 '테스트용으로 사용할 ~' → '테스트용 ~'처럼 사실상 원문이 통과된 사례, 유사도 0.91)
+    if difflib.SequenceMatcher(None, _norm(out), _norm(raw)).ratio() >= NOOP_SIMILARITY:
         return "NOOP"
     if "```" in out and "```" not in raw:
         return "ANSWER"
@@ -185,27 +190,18 @@ async def chat_stream_endpoint(request: ChatRequest):
 
 
 async def _generate_main_llm_json_response(prompt: str, soc_action: str, threat_score: float):
-    """메인 LLM JSON 응답 생성 헬퍼 함수 (Fallback Chain 순차 적용)"""
-    for current_model in MAIN_MODELS_CHAIN:
-        try:
-            response = await client.aio.models.generate_content(
-                model=current_model, contents=prompt
-            )
-            return {
-                "status": "success",
-                "soc_action": soc_action,
-                "threat_score": threat_score,
-                "response": response.text,
-                "model_used": current_model,
-            }
-        except errors.APIError as e:
-            print(f"[Main LLM Warning] {current_model} failed ({e.code}). Switching to next model...")
-            continue
-        except Exception as e:
-            print(f"[Main LLM Error] {current_model} unexpected error: {e}")
-            continue
-
-    raise HTTPException(
-        status_code=503,
-        detail="[SOC Warning] All upstream AI models in chain are currently unavailable. Please try again later.",
-    )
+    """메인 LLM JSON 응답 생성 헬퍼 함수 (Fallback Chain + 서킷 브레이커, agents.generate_main_llm_text 사용)"""
+    try:
+        text, model_used = await generate_main_llm_text(prompt, MAIN_MODELS_CHAIN)
+    except RuntimeError:
+        raise HTTPException(
+            status_code=503,
+            detail="[SOC Warning] All upstream AI models in chain are currently unavailable. Please try again later.",
+        )
+    return {
+        "status": "success",
+        "soc_action": soc_action,
+        "threat_score": threat_score,
+        "response": text,
+        "model_used": model_used,
+    }

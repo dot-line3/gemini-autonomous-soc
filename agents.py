@@ -218,29 +218,70 @@ def fallback_regex_check(user_prompt: str) -> dict:
     # 위협 점수를 0.0으로 통과시키면 API 장애 시 모든 공격이 무검사로 메인 LLM에 도달한다.
     raise SecurityAnalysisUnavailable("L1 security analysis unavailable and regex fallback inconclusive.")
 
+MAIN_CALL_TIMEOUT_S = 20.0  # 메인 응답은 답변 길이에 따라 5~10초. 응답 없이 멈춘 모델에 묶이지 않도록 제한
+
+
+def _record_main_failure(model: str, e: Exception) -> None:
+    """메인 LLM 실패를 보안 판정과 같은 서킷 상태에 기록한다.
+    같은 API 키의 할당량을 공유하므로, 어느 쪽에서 429가 나든 다른 쪽도 그 모델을 건너뛴다."""
+    if isinstance(e, errors.APIError) and e.code == 429:
+        _record_rate_limit(model, e)
+    elif isinstance(e, errors.APIError) and e.code == 404:
+        _record_unavailable(model, e)
+    elif isinstance(e, (asyncio.TimeoutError, TimeoutError)):
+        _record_slow(model)
+    else:
+        _release_attempt(model)
+
+
+async def generate_main_llm_text(prompt: str, model_chain: list[str]) -> tuple[str, str]:
+    """메인 LLM 응답 생성 (서킷 브레이커 + 호출 제한 시간 적용). (응답 텍스트, 사용 모델) 반환.
+    모든 모델이 실패하면 RuntimeError."""
+    for current_model in _model_order(model_chain):
+        _mark_attempt(current_model)
+        try:
+            response = await asyncio.wait_for(
+                client.aio.models.generate_content(model=current_model, contents=prompt),
+                timeout=MAIN_CALL_TIMEOUT_S,
+            )
+            _record_success(current_model)
+            return response.text or "", current_model
+        except Exception as e:
+            code = getattr(e, "code", type(e).__name__)
+            logger.warning("Main %s failed (%s): %s", current_model, code, str(e)[:200])
+            print(f"[Main LLM Warning] {current_model} failed ({code}). Switching to next model...")
+            _record_main_failure(current_model, e)
+            continue
+    raise RuntimeError("All main LLM models failed")
+
+
 async def stream_main_llm_response(prompt: str, model_chain: list[str]):
-    """메인 LLM 응답을 스트리밍 비동기 제너레이터로 생성 (Fallback Chain 적용)"""
-    for current_model in model_chain:
+    """메인 LLM 응답을 스트리밍 비동기 제너레이터로 생성 (Fallback Chain + 서킷 브레이커 적용)"""
+    for current_model in _model_order(model_chain):
+        _mark_attempt(current_model)
         has_yielded = False
         try:
-            # 비동기 스트리밍 API 호출
-            response_stream = await client.aio.models.generate_content_stream(
-                model=current_model,
-                contents=prompt
+            # 첫 응답까지만 제한 시간을 둔다 (스트리밍 도중의 긴 답변은 끊지 않음)
+            response_stream = await asyncio.wait_for(
+                client.aio.models.generate_content_stream(model=current_model, contents=prompt),
+                timeout=MAIN_CALL_TIMEOUT_S,
             )
             async for chunk in response_stream:
                 if chunk.text:
                     has_yielded = True
                     yield chunk.text
+            _record_success(current_model)
             return  # 성공적으로 스트리밍이 완료되면 종료
 
         except Exception as e:
             if has_yielded:
                 # 이미 일부 응답을 보낸 뒤 실패하면 다른 모델로 처음부터 다시 생성하지 않음
                 # (사용자 화면에 앞부분이 중복 출력되는 문제 방지)
+                _release_attempt(current_model)
                 print(f"[Main LLM Stream Error] {current_model} failed mid-stream: {e}")
                 yield "\n[SOC Error] Response stream interrupted."
                 return
+            _record_main_failure(current_model, e)
             print(f"[Main LLM Stream Warning] {current_model} failed: {e}. Switching to next model...")
             continue
 
